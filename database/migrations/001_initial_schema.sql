@@ -36,7 +36,7 @@ CREATE TABLE suppliers (
 );
 
 -- ---------------------------------------------------------------
--- Склады
+-- Склады (собственные)
 -- ---------------------------------------------------------------
 CREATE TABLE warehouses (
     id          BIGSERIAL PRIMARY KEY,
@@ -47,15 +47,17 @@ CREATE TABLE warehouses (
     updated_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
--- Ячейки склада — физические места хранения
-CREATE TABLE warehouse_cells (
+-- Подсклады маркетплейсов (Ozon, Wildberries и т.д.)
+-- У каждого маркетплейса много складов — храним их здесь
+CREATE TABLE sub_warehouses (
     id              BIGSERIAL PRIMARY KEY,
-    warehouse_id    BIGINT          NOT NULL REFERENCES warehouses(id),
-    code            VARCHAR(100)    NOT NULL,   -- напр. "A-01-03"
-    description     VARCHAR(255),
+    name            VARCHAR(255)    NOT NULL,
+    marketplace     VARCHAR(30)     NOT NULL DEFAULT 'own',
+    -- own | ozon | wildberries
+    external_id     VARCHAR(100),   -- ID склада в системе маркетплейса
     is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    UNIQUE (warehouse_id, code)
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
 -- ---------------------------------------------------------------
@@ -75,7 +77,7 @@ CREATE TABLE categories (
 -- ---------------------------------------------------------------
 CREATE TABLE products (
     id          BIGSERIAL PRIMARY KEY,
-    sku         VARCHAR(100)    NOT NULL UNIQUE,  -- внутренний артикул
+    sku         VARCHAR(100)    NOT NULL UNIQUE,
     name        VARCHAR(500)    NOT NULL,
     description TEXT,
     barcode     VARCHAR(100),
@@ -115,18 +117,54 @@ CREATE TABLE product_properties (
 );
 
 -- ---------------------------------------------------------------
+-- Справочник статусов закупок
+-- ---------------------------------------------------------------
+CREATE TABLE purchase_statuses (
+    id          BIGSERIAL PRIMARY KEY,
+    name        VARCHAR(100)    NOT NULL UNIQUE,
+    color       VARCHAR(7),     -- HEX, напр. "#4CAF50"
+    sort_order  INT             NOT NULL DEFAULT 0,
+    is_active   BOOLEAN         NOT NULL DEFAULT TRUE
+);
+
+INSERT INTO purchase_statuses (name, color, sort_order) VALUES
+    ('Черновик',              '#9E9E9E', 10),
+    ('Согласование',          '#FF9800', 20),
+    ('Подтверждено',          '#2196F3', 30),
+    ('Отправлено поставщику', '#9C27B0', 40),
+    ('Частично получено',     '#FF5722', 50),
+    ('Получено',              '#4CAF50', 60),
+    ('Отменено',              '#F44336', 70);
+
+-- ---------------------------------------------------------------
 -- Закупки
 -- ---------------------------------------------------------------
 CREATE TABLE purchases (
+    id                      BIGSERIAL PRIMARY KEY,
+    name                    VARCHAR(255)    NOT NULL,
+    type                    VARCHAR(30)     NOT NULL DEFAULT 'purchase',
+    -- purchase | return | movement | draft
+    status_id               BIGINT          NOT NULL REFERENCES purchase_statuses(id),
+    supplier_id             BIGINT          REFERENCES suppliers(id),
+    manager_id              BIGINT          NOT NULL REFERENCES users(id),
+    planned_warehouse_id    BIGINT          REFERENCES warehouses(id),
+    export_date             DATE,
+    export_time             TIME,
+    ticket_number           VARCHAR(100),
+    invoice_number          VARCHAR(100),   -- номер накладной во внешнем сервисе
+    notes                   TEXT,
+    created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+-- Прикреплённые файлы закупки
+CREATE TABLE purchase_files (
     id              BIGSERIAL PRIMARY KEY,
-    supplier_id     BIGINT          NOT NULL REFERENCES suppliers(id),
-    created_by      BIGINT          NOT NULL REFERENCES users(id),
-    status          VARCHAR(30)     NOT NULL DEFAULT 'draft',
-    -- draft | confirmed | partially_received | received | cancelled
-    expected_date   DATE,
-    notes           TEXT,
-    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+    purchase_id     BIGINT          NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,
+    file_name       VARCHAR(255)    NOT NULL,
+    file_path       TEXT            NOT NULL,
+    uploaded_by     BIGINT          NOT NULL REFERENCES users(id),
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
 -- Строки закупок
@@ -141,11 +179,11 @@ CREATE TABLE purchase_lines (
 );
 
 -- ---------------------------------------------------------------
--- Поступления (фактическая приёмка товара на склад)
+-- Поступления (создаются автоматически при проведении закупки)
 -- ---------------------------------------------------------------
 CREATE TABLE receipts (
     id              BIGSERIAL PRIMARY KEY,
-    purchase_id     BIGINT          REFERENCES purchases(id),   -- может быть без закупки
+    purchase_id     BIGINT          NOT NULL REFERENCES purchases(id),
     warehouse_id    BIGINT          NOT NULL REFERENCES warehouses(id),
     created_by      BIGINT          NOT NULL REFERENCES users(id),
     status          VARCHAR(30)     NOT NULL DEFAULT 'draft',
@@ -160,7 +198,7 @@ CREATE TABLE receipts (
 CREATE TABLE receipt_lines (
     id                  BIGSERIAL PRIMARY KEY,
     receipt_id          BIGINT          NOT NULL REFERENCES receipts(id)       ON DELETE CASCADE,
-    purchase_line_id    BIGINT          REFERENCES purchase_lines(id),         -- опционально
+    purchase_line_id    BIGINT          NOT NULL REFERENCES purchase_lines(id),
     product_id          BIGINT          NOT NULL REFERENCES products(id),
     quantity_expected   NUMERIC(12, 3)  NOT NULL CHECK (quantity_expected >= 0),
     quantity_received   NUMERIC(12, 3)  NOT NULL DEFAULT 0 CHECK (quantity_received >= 0),
@@ -169,12 +207,14 @@ CREATE TABLE receipt_lines (
 );
 
 -- ---------------------------------------------------------------
--- Бронирования товаров в ячейках строк поступлений
+-- Бронирования товаров из строк поступлений
+-- Привязываются к подскладу маркетплейса (Ozon / WB / собственный)
+-- В дальнейшем будут связаны со списаниями / заказами
 -- ---------------------------------------------------------------
 CREATE TABLE reservations (
     id                  BIGSERIAL PRIMARY KEY,
-    receipt_line_id     BIGINT          NOT NULL REFERENCES receipt_lines(id)   ON DELETE CASCADE,
-    cell_id             BIGINT          NOT NULL REFERENCES warehouse_cells(id),
+    receipt_line_id     BIGINT          NOT NULL REFERENCES receipt_lines(id) ON DELETE CASCADE,
+    sub_warehouse_id    BIGINT          REFERENCES sub_warehouses(id),
     quantity            NUMERIC(12, 3)  NOT NULL CHECK (quantity > 0),
     status              VARCHAR(30)     NOT NULL DEFAULT 'reserved',
     -- reserved | placed | released
@@ -187,12 +227,15 @@ CREATE TABLE reservations (
 -- Индексы
 -- =============================================================
 
-CREATE INDEX ON warehouse_cells (warehouse_id);
+CREATE INDEX ON sub_warehouses (marketplace);
 CREATE INDEX ON product_categories (category_id);
 CREATE INDEX ON product_properties (product_id);
 CREATE INDEX ON product_properties (property_id);
+CREATE INDEX ON purchases (status_id);
 CREATE INDEX ON purchases (supplier_id);
-CREATE INDEX ON purchases (status);
+CREATE INDEX ON purchases (manager_id);
+CREATE INDEX ON purchases (type);
+CREATE INDEX ON purchase_files (purchase_id);
 CREATE INDEX ON purchase_lines (purchase_id);
 CREATE INDEX ON purchase_lines (product_id);
 CREATE INDEX ON receipts (purchase_id);
@@ -201,5 +244,5 @@ CREATE INDEX ON receipts (status);
 CREATE INDEX ON receipt_lines (receipt_id);
 CREATE INDEX ON receipt_lines (product_id);
 CREATE INDEX ON reservations (receipt_line_id);
-CREATE INDEX ON reservations (cell_id);
+CREATE INDEX ON reservations (sub_warehouse_id);
 CREATE INDEX ON reservations (status);
