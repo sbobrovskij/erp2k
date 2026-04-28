@@ -4,6 +4,11 @@
 -- =============================================================
 
 -- ---------------------------------------------------------------
+-- Enum типов закупки
+-- ---------------------------------------------------------------
+CREATE TYPE purchase_type AS ENUM ('purchase', 'return', 'movement');
+
+-- ---------------------------------------------------------------
 -- Пользователи
 -- ---------------------------------------------------------------
 CREATE TABLE users (
@@ -48,13 +53,11 @@ CREATE TABLE warehouses (
 );
 
 -- Подсклады маркетплейсов (Ozon, Wildberries и т.д.)
--- У каждого маркетплейса много складов — храним их здесь
 CREATE TABLE sub_warehouses (
     id              BIGSERIAL PRIMARY KEY,
     name            VARCHAR(255)    NOT NULL,
-    marketplace     VARCHAR(30)     NOT NULL DEFAULT 'own',
-    -- own | ozon | wildberries
-    external_id     VARCHAR(100),   -- ID склада в системе маркетплейса
+    marketplace     VARCHAR(30)     NOT NULL DEFAULT 'own',  -- own | ozon | wildberries
+    external_id     VARCHAR(100),
     is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
@@ -88,7 +91,6 @@ CREATE TABLE products (
     updated_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
--- Связки категорий с товарами (many-to-many)
 CREATE TABLE product_categories (
     product_id      BIGINT  NOT NULL REFERENCES products(id)   ON DELETE CASCADE,
     category_id     BIGINT  NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
@@ -96,7 +98,7 @@ CREATE TABLE product_categories (
 );
 
 -- ---------------------------------------------------------------
--- Свойства (характеристики: Цвет, Размер, Материал …)
+-- Свойства товаров
 -- ---------------------------------------------------------------
 CREATE TABLE properties (
     id          BIGSERIAL PRIMARY KEY,
@@ -105,7 +107,6 @@ CREATE TABLE properties (
     created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
--- Значения свойств у товаров
 CREATE TABLE product_properties (
     id              BIGSERIAL PRIMARY KEY,
     product_id      BIGINT          NOT NULL REFERENCES products(id)    ON DELETE CASCADE,
@@ -122,7 +123,7 @@ CREATE TABLE product_properties (
 CREATE TABLE purchase_statuses (
     id          BIGSERIAL PRIMARY KEY,
     name        VARCHAR(100)    NOT NULL UNIQUE,
-    color       VARCHAR(7),     -- HEX, напр. "#4CAF50"
+    color       VARCHAR(7),
     sort_order  INT             NOT NULL DEFAULT 0,
     is_active   BOOLEAN         NOT NULL DEFAULT TRUE
 );
@@ -141,23 +142,23 @@ INSERT INTO purchase_statuses (name, color, sort_order) VALUES
 -- ---------------------------------------------------------------
 CREATE TABLE purchases (
     id                      BIGSERIAL PRIMARY KEY,
-    name                    VARCHAR(255)    NOT NULL,
-    type                    VARCHAR(30)     NOT NULL DEFAULT 'purchase',
-    -- purchase | return | movement | draft
-    status_id               BIGINT          NOT NULL REFERENCES purchase_statuses(id),
-    supplier_id             BIGINT          REFERENCES suppliers(id),
-    manager_id              BIGINT          NOT NULL REFERENCES users(id),
-    planned_warehouse_id    BIGINT          REFERENCES warehouses(id),
+    name                    VARCHAR(255)        NOT NULL,
+    type                    purchase_type       NOT NULL DEFAULT 'purchase',
+    status_id               BIGINT              NOT NULL REFERENCES purchase_statuses(id),
+    supplier_id             BIGINT              REFERENCES suppliers(id),
+    manager_id              BIGINT              NOT NULL REFERENCES users(id),
+    created_by              BIGINT              NOT NULL REFERENCES users(id),
+    planned_warehouse_id    BIGINT              REFERENCES warehouses(id),
     export_date             DATE,
     export_time             TIME,
     ticket_number           VARCHAR(100),
-    invoice_number          VARCHAR(100),   -- номер накладной во внешнем сервисе
+    invoice_number          VARCHAR(100),
     notes                   TEXT,
-    created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    updated_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+    posted_at               TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ         NOT NULL DEFAULT NOW()
 );
 
--- Прикреплённые файлы закупки
 CREATE TABLE purchase_files (
     id              BIGSERIAL PRIMARY KEY,
     purchase_id     BIGINT          NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,
@@ -167,7 +168,6 @@ CREATE TABLE purchase_files (
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
--- Строки закупок
 CREATE TABLE purchase_lines (
     id              BIGSERIAL PRIMARY KEY,
     purchase_id     BIGINT          NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,
@@ -179,22 +179,20 @@ CREATE TABLE purchase_lines (
 );
 
 -- ---------------------------------------------------------------
--- Поступления (создаются автоматически при проведении закупки)
+-- Поступления (создаются при проведении закупки)
 -- ---------------------------------------------------------------
 CREATE TABLE receipts (
     id              BIGSERIAL PRIMARY KEY,
     purchase_id     BIGINT          NOT NULL REFERENCES purchases(id),
     warehouse_id    BIGINT          NOT NULL REFERENCES warehouses(id),
     created_by      BIGINT          NOT NULL REFERENCES users(id),
-    status          VARCHAR(30)     NOT NULL DEFAULT 'draft',
-    -- draft | in_progress | completed | cancelled
+    status          VARCHAR(30)     NOT NULL DEFAULT 'draft',  -- draft | in_progress | completed | cancelled
     received_at     TIMESTAMPTZ,
     notes           TEXT,
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
--- Строки поступлений
 CREATE TABLE receipt_lines (
     id                  BIGSERIAL PRIMARY KEY,
     receipt_id          BIGINT          NOT NULL REFERENCES receipts(id)       ON DELETE CASCADE,
@@ -207,17 +205,14 @@ CREATE TABLE receipt_lines (
 );
 
 -- ---------------------------------------------------------------
--- Бронирования товаров из строк поступлений
--- Привязываются к подскладу маркетплейса (Ozon / WB / собственный)
--- В дальнейшем будут связаны со списаниями / заказами
+-- Бронирования из строк поступлений → подсклады маркетплейсов
 -- ---------------------------------------------------------------
 CREATE TABLE reservations (
     id                  BIGSERIAL PRIMARY KEY,
     receipt_line_id     BIGINT          NOT NULL REFERENCES receipt_lines(id) ON DELETE CASCADE,
     sub_warehouse_id    BIGINT          REFERENCES sub_warehouses(id),
     quantity            NUMERIC(12, 3)  NOT NULL CHECK (quantity > 0),
-    status              VARCHAR(30)     NOT NULL DEFAULT 'reserved',
-    -- reserved | placed | released
+    status              VARCHAR(30)     NOT NULL DEFAULT 'reserved',  -- reserved | placed | released
     created_by          BIGINT          NOT NULL REFERENCES users(id),
     created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
@@ -235,6 +230,7 @@ CREATE INDEX ON purchases (status_id);
 CREATE INDEX ON purchases (supplier_id);
 CREATE INDEX ON purchases (manager_id);
 CREATE INDEX ON purchases (type);
+CREATE INDEX ON purchases (created_by);
 CREATE INDEX ON purchase_files (purchase_id);
 CREATE INDEX ON purchase_lines (purchase_id);
 CREATE INDEX ON purchase_lines (product_id);
